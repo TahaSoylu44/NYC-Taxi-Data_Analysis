@@ -22,12 +22,13 @@ def iqr_upperbound(series_string, df):
     iqr = q3 - q1
     return (q3 + 1.5 * iqr)
 
-# ==========================================
-# 2. TEMİZLİK MODÜLLERİ
-# ==========================================
-def clean_yellow_green(df):
-    """Yellow ve Green taksiler için ücret, bahşiş ve mesafe temizliği"""
-    
+def clean_yellow(df):
+    """Yellow taksiler için veri temizliği"""
+    df["tpep_pickup_datetime"] = pd.to_datetime(df["tpep_pickup_datetime"])
+    df["tpep_dropoff_datetime"] = pd.to_datetime(df["tpep_dropoff_datetime"])
+
+    df.drop(columns=["VendorID", "store_and_fwd_flag", "congestion_surcharge", "payment_type", "airport_fee"], inplace=True)
+
     #! fare_amount
     df = df[df['fare_amount'] >= 1]
     df = df[df['trip_distance'] > 0]
@@ -42,54 +43,48 @@ def clean_yellow_green(df):
     df = df[df["extra"] <= upper_bound]
 
     #! mta_tax
-    #? Burada kaldin
+    df = df[df["mta_tax"] >= 0]
 
-    # Orantısal Bahşiş Temizliği (Maksimum %55)
-    df["bahsis_orani"] = df["tip_amount"] / df["fare_amount"]
-    df = df[df["bahsis_orani"] <= 0.55]
-    df.drop(columns=["bahsis_orani"], inplace=True) # RAM'den tasarruf
+    #! tip_amount
+    df = df[df["tip_amount"] >= 0]
+    df["bahsis_per_fare"] = df["tip_amount"] / df["fare_amount"]
+    df["bahsis_per_fare_normalize"] = np.log1p(df["bahsis_per_fare"])
+    df = df[apply_advanced_zscore(df["bahsis_per_fare_normalize"], 3.5)]
+    df.drop(columns=["bahsis_per_fare", "bahsis_per_fare_normalize"], inplace=True)
+
+    #! tolls_amount
+    df = df[(df['tolls_amount'] >= 0) & (df['tolls_amount'] <= 30)]
+
+    #! duration
+    df["duration"] = (df["tpep_dropoff_datetime"] - df["tpep_pickup_datetime"]).dt.total_seconds() / 60
+    df = df[df["duration"] > 0]
+    df["duration_normalize"] = np.log1p(df["duration"])
+    df = df[apply_advanced_zscore(df["duration_normalize"], 3.5)]
+    df.drop(columns=["duration_normalize"], inplace=True)
+
+    #! passenger_count
+    df = df[(df["passenger_count"] > 0) & (df["passenger_count"] <= 6)]
     
-    # Gişe (Tolls) Temizliği
-    df = df[(df['tolls_amount'] >= 0) & (df['tolls_amount'] <= 40)]
-    
-    # Süre Temizliği (Örn: 2 dakikadan uzun, 120 dakikadan kısa)
-    # Not: Eğer duration sütunu hazır gelmiyorsa (tpep_dropoff - tpep_pickup) hesaplamalısın
-    # df = df[(df['duration'] > 2) & (df['duration'] < 120)]
-    
-    # Mesafe Temizliği (MAD Z-Skor)
-    df = df[df['trip_distance'] > 0]
-    gecerli_mesafeler = apply_advanced_zscore(df['trip_distance'], threshold=3.5)
-    df = df[gecerli_mesafeler]
+    #! trip_distance
+    df = df[(df['trip_distance'] > 0) & (df["trip_distance"] <= 30)]
+
+    #! RatecodeID
+    df = df[df["RatecodeID"] != 99]
+
+    #! speed
+    df["speed"] = (df["trip_distance"] / df["duration"]) * 60 * 1.61    # km/h
+    df = df[(df["speed"] > 0) & (df["speed"] <= 110)]
+
+    df.drop_duplicates(inplace=True)
     
     return df
 
-def clean_fhv(df):
-    """FHV (Uber/Lyft) verileri ücret içermez, sadece null değerler temizlenir."""
-    # Sütun isimleri genelde 'Pickup_date' ve 'DropOff_datetime' şeklindedir
-    df = df.dropna(subset=['Pickup_date', 'DropOff_datetime'])
-    return df
-
-# ==========================================
-# 3. AGREGASYON (SIKIŞTIRMA) MODÜLÜ
-# ==========================================
-def aggregate_hourly_trips(df, pickup_col):
-    """
-    12 milyon satırlık ham veriyi, 'Saat -> Yolculuk Sayısı' formatına sıkıştırır.
-    Modele girecek asıl hafif veri budur.
-    """
-    df[pickup_col] = pd.to_datetime(df[pickup_col])
-    
-    # Dakika ve saniyeleri atarak sadece "Saat" bazında grupla
-    df['pickup_hour'] = df[pickup_col].dt.floor('h')
-    
-    # Hangi saatte kaç yolculuk yapılmış say
-    df_aggregated = df.groupby('pickup_hour').size().reset_index(name='trip_count')
+def aggregate_hourly_trips(df):
+    df['pickup_hour'] = df["tpep_pickup_datetime"].dt.floor('h')    # saatlik gruplama yap
+    df_aggregated = df.groupby(['pickup_hour', "PULocationID"]).size().reset_index(name='trip_count') # hangi saatte kaç yolculuk?
     
     return df_aggregated
 
-# ==========================================
-# 4. ANA DÖNGÜ (MOTOR)
-# ==========================================
 def run_pipeline(input_folder, output_folder):
     """Klasördeki dosyaları tek tek okur, işler ve belleği temizleyerek kaydeder."""
     
@@ -101,40 +96,40 @@ def run_pipeline(input_folder, output_folder):
     for file_path in file_paths:
         file_name = os.path.basename(file_path)
         print(f"[*] İşleniyor: {file_name}")
-        
-        # Dosyayı oku
-        df = pd.read_parquet(file_path)
-        
-        # İsme göre strateji belirle
-        file_name_lower = file_name.lower()
-        if "yellow" in file_name_lower:
-            df = clean_yellow_green(df)
-            df_agg = aggregate_hourly_trips(df, pickup_col="tpep_pickup_datetime")
-            
-        elif "green" in file_name_lower:
-            df = clean_yellow_green(df)
-            df_agg = aggregate_hourly_trips(df, pickup_col="lpep_pickup_datetime")
-            
-        elif "fhv" in file_name_lower:
-            df = clean_fhv(df)
-            df_agg = aggregate_hourly_trips(df, pickup_col="Pickup_date")
-        else:
-            print(f"[-] Atlandı (Bilinmeyen tür): {file_name}")
+        try:    
+            df = pd.read_parquet(file_path)
+            file_name_lower = file_name.lower()
+            if "yellow" in file_name_lower:
+                df = clean_yellow(df)
+                df_agg = aggregate_hourly_trips(df)
+            else:
+                print(f"[-] Atlandı (Bilinmeyen tür): {file_name}")
+                continue
+                
+            # Agrege edilmiş yeni dosyayı kaydet
+            output_path = os.path.join(output_folder, f"agg_{file_name}")
+            df_agg.to_parquet(output_path, index=False)
+            print(f"[+] Kaydedildi: agg_{file_name}\n")
+        except Exception as e:
+            print(f"[!] HATA - {file_name}: {e}")
             continue
-            
-        # Agrege edilmiş yeni dosyayı kaydet
-        output_path = os.path.join(output_folder, f"agg_{file_name}")
-        df_agg.to_parquet(output_path, index=False)
-        print(f"[+] Kaydedildi: agg_{file_name}\n")
 
-# ==========================================
-# ÇALIŞTIRMA NOKTASI
-# ==========================================
+def concatanate():
+    clear_files = glob.glob("./processed_taxi_data/agg_*.parquet")
+    table_list = []
+
+    for file in clear_files:
+        small_table = pd.read_parquet(file)
+        table_list.append(small_table)
+
+    df_master = pd.concat(table_list, ignore_index=True)
+    df_master.to_parquet("./final_time_split_data.parquet", index=False)
+
 if __name__ == "__main__":
-    # Klasör yollarını kendi sistemine göre ayarla
-    GIRDI_KLASORU = "./raw_taxi_data"
-    CIKTI_KLASORU = "./processed_taxi_data"
+    INPUT_FOLDER = "./datas"
+    OUTPUT_FOLDER = "./processed_taxi_data"
     
-    print(">>> Veri Boru Hattı Başlatılıyor...")
-    run_pipeline(GIRDI_KLASORU, CIKTI_KLASORU)
-    print(">>> Tüm işlemler başarıyla tamamlandı.")
+    print("Pipeline started...")
+    run_pipeline(INPUT_FOLDER, OUTPUT_FOLDER)
+    concatanate()
+    print("The process is done :D")
