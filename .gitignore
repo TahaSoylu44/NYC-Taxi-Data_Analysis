@@ -1,5 +1,5 @@
 .venv/
 datas/
-*.txt
+notes.txt
 temizlenmis/
 processed_taxi_data/
