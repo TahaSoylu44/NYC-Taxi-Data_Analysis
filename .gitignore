@@ -3,3 +3,6 @@ datas/
 notes.txt
 temizlenmis/
 processed_taxi_data/
+catboost_info/
+shap/
+lime_stability/
